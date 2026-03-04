@@ -25,7 +25,6 @@ import { useTheme } from "@mui/material/styles";
 import { DataGrid, type GridColDef, type GridRenderCellParams } from "@mui/x-data-grid";
 import SearchIcon from "@mui/icons-material/Search";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
-import PaidIcon from "@mui/icons-material/Paid";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import { api } from "../lib/api";
 

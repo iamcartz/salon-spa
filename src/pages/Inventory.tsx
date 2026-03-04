@@ -33,10 +33,10 @@ type Row = {
   sku?: string | null;
   name: string;
   unit: string;
-  qty_on_hand: number;
-  reorder_level: number;
-  cost: number;
-  price: number;
+  qty_on_hand: any;
+  reorder_level: any;
+  cost: any;
+  price: any;
   status: "active" | "inactive";
   created_at?: string | null;
 };
@@ -232,7 +232,12 @@ export default function Inventory() {
 
     if (!isMobile) {
       return (
-        <Stack direction="row" spacing={1} justifyContent="flex-end" sx={{ width: "100%" }}>
+        <Stack
+          direction="row"
+          spacing={1}
+          justifyContent="flex-end"
+          sx={{ width: "100%", pr: 1, "& .MuiButton-root": { flexShrink: 0, minWidth: 86 } }}
+        >
           <Button size="small" variant="outlined" onClick={() => openEdit(row)}>
             Edit
           </Button>
@@ -273,57 +278,67 @@ export default function Inventory() {
 
   const cols: GridColDef[] = useMemo(
     () => [
-      { field: "id", headerName: "ID", flex: 0.45, minWidth: 70 },
-      { field: "sku", headerName: "SKU", flex: 1, minWidth: 120 },
+      { field: "id", headerName: "ID", flex: 0.5, minWidth: 70 },
+      { field: "sku", headerName: "SKU", flex: 1, minWidth: 140 },
+
       {
         field: "name",
         headerName: "Item",
-        flex: 1.6,
-        minWidth: 200,
+        flex: 1.8,
+        minWidth: 260,
         renderCell: (p: GridRenderCellParams<any, Row>) => (
-          <Stack spacing={0.4} sx={{ py: 0.5 }}>
-            <Typography sx={{ fontWeight: 800, lineHeight: 1.2 }}>{p.row.name}</Typography>
-            <Stack direction="row" spacing={1} sx={{ alignItems: "center", flexWrap: "wrap", gap: 1 }}>
-              <Typography variant="caption" color="text.secondary">
-                Unit: {p.row.unit}
-              </Typography>
-              <StockChip row={p.row} />
-            </Stack>
+          <Stack spacing={0.4} sx={{ py: 0.6, minWidth: 0 }}>
+            <Typography sx={{ fontWeight: 800, lineHeight: 1.2 }} noWrap>
+              {p.row.name}
+            </Typography>
+            <Typography variant="caption" color="text.secondary" sx={{ lineHeight: 1.2 }}>
+              Unit: {p.row.unit}
+            </Typography>
+            <StockChip row={p.row} />
           </Stack>
         ),
       },
+
       {
         field: "qty_on_hand",
         headerName: "On hand",
         flex: 0.9,
         minWidth: 120,
-        type: "number",
-        valueFormatter: (p: any) => money(p.value),
+        align: "right",
+        headerAlign: "right",
+        renderCell: (p: GridRenderCellParams<any, Row>) => <>{money(p.row.qty_on_hand)}</>,
       },
+
       {
         field: "reorder_level",
         headerName: "Reorder",
         flex: 0.9,
         minWidth: 120,
-        type: "number",
-        valueFormatter: (p: any) => money(p.value),
+        align: "right",
+        headerAlign: "right",
+        renderCell: (p: GridRenderCellParams<any, Row>) => <>{money(p.row.reorder_level)}</>,
       },
+
       {
         field: "cost",
         headerName: "Cost",
         flex: 0.9,
         minWidth: 120,
-        type: "number",
-        valueFormatter: (p: any) => money(p.value),
+        align: "right",
+        headerAlign: "right",
+        renderCell: (p: GridRenderCellParams<any, Row>) => <>{money(p.row.cost)}</>,
       },
+
       {
         field: "price",
         headerName: "Price",
         flex: 0.9,
         minWidth: 120,
-        type: "number",
-        valueFormatter: (p: any) => money(p.value),
+        align: "right",
+        headerAlign: "right",
+        renderCell: (p: GridRenderCellParams<any, Row>) => <>{money(p.row.price)}</>,
       },
+
       {
         field: "status",
         headerName: "Status",
@@ -331,21 +346,21 @@ export default function Inventory() {
         minWidth: 120,
         renderCell: (p: GridRenderCellParams<any, Row>) => <StatusChip status={(p.value || "active") as any} />,
       },
+
       {
         field: "actions",
         headerName: "",
         sortable: false,
         filterable: false,
         disableColumnMenu: true,
-        flex: 0.9,
-        minWidth: 120,
+        flex: 1.2,
+        minWidth: 210,
         align: "right",
         headerAlign: "right",
         renderCell: (p: GridRenderCellParams<any, Row>) => <ActionsCell row={p.row} />,
       },
     ],
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [isMobile, rows]
+    [isMobile]
   );
 
   return (
@@ -421,7 +436,7 @@ export default function Inventory() {
               label={lowStockOnly ? "Low stock only" : "Show all stock"}
               color={lowStockOnly ? "warning" : "default"}
               variant={lowStockOnly ? "filled" : "outlined"}
-              sx={{ fontWeight: 900, justifyContent: "flex-start", minWidth: { xs: "100%", sm: 180 } }}
+              sx={{ fontWeight: 900, justifyContent: "flex-start", minWidth: { xs: "100%", sm: 190 } }}
             />
 
             <Box sx={{ flex: 1 }} />
@@ -435,7 +450,7 @@ export default function Inventory() {
 
       {/* Table */}
       <Card sx={{ borderRadius: 4 }}>
-        <CardContent>
+        <CardContent sx={{ p: { xs: 1, sm: 2 } }}>
           <DataGrid
             autoHeight
             rows={filtered}
@@ -443,13 +458,19 @@ export default function Inventory() {
             loading={loading}
             disableRowSelectionOnClick
             disableColumnMenu
-            density="compact"
+            density="standard"
+            getRowHeight={() => "auto"} // ✅ fixes Item text clipping
             pageSizeOptions={[10, 25, 50]}
             initialState={{ pagination: { paginationModel: { pageSize: 10, page: 0 } } }}
             sx={{
               border: 0,
-              "& .MuiDataGrid-cell": { outline: "none" },
-              "& .MuiDataGrid-columnHeaders": { borderRadius: 2 },
+              "& .MuiDataGrid-cell": {
+                outline: "none",
+                py: 1,
+                alignItems: "flex-start",
+              },
+              "& .MuiDataGrid-row": { maxHeight: "none !important" },
+              "& .MuiDataGrid-virtualScroller": { overflowX: "auto" },
             }}
             localeText={{
               noRowsLabel: "No inventory items yet. Click “Add Item” to create your first record.",
