@@ -1,25 +1,34 @@
 // src/pages/Appointments.tsx
 import { useEffect, useMemo, useState } from "react";
 import {
+  Alert,
   Box,
   Button,
   Card,
   CardContent,
+  Chip,
   Dialog,
   DialogActions,
   DialogContent,
   DialogTitle,
+  IconButton,
+  InputAdornment,
+  Menu,
   MenuItem,
+  Snackbar,
+  Stack,
   TextField,
   Typography,
+  useMediaQuery,
 } from "@mui/material";
-import { DataGrid } from "@mui/x-data-grid";
-import type { GridColDef } from "@mui/x-data-grid";
+import { useTheme } from "@mui/material/styles";
+import { DataGrid, type GridColDef, type GridRenderCellParams } from "@mui/x-data-grid";
+import SearchIcon from "@mui/icons-material/Search";
+import MoreVertIcon from "@mui/icons-material/MoreVert";
+import EventIcon from "@mui/icons-material/Event";
 import { api } from "../lib/api";
 
-type Client = { id: number; first_name: string; last_name: string };
-type Staff = { id: number; first_name: string; last_name: string; commission_rate: number };
-type Service = { id: number; name: string; price: number; commission_rate: number | null; duration_mins: number };
+type Status = "booked" | "checked_in" | "completed" | "cancelled" | "no_show";
 
 type Row = {
   id: number;
@@ -29,317 +38,629 @@ type Row = {
   staff_name: string;
   start_at: string;
   end_at: string;
-  status: "booked" | "checked_in" | "completed" | "cancelled" | "no_show";
-  notes?: string;
+  status: Status;
+  notes?: string | null;
 };
 
-const statusOptions: Row["status"][] = ["booked", "checked_in", "completed", "cancelled", "no_show"];
+type Client = { id: number; first_name: string; last_name: string; status: string };
+type Staff = { id: number; first_name: string; last_name: string; status: string };
+type Service = { id: number; name: string; price: number; status: string; category?: string };
 
-function fmtLocal(dt: string) {
-  // dt is ISO-like "YYYY-MM-DD HH:mm:ss" or "YYYY-MM-DDTHH:mm"
-  // keep it simple for MVP: display as-is
-  return dt?.replace("T", " ");
+function isoDate(d: Date) {
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function parseYmd(ymd: string) {
+  const [y, m, d] = ymd.split("-").map((n) => Number(n));
+  return new Date(y, (m || 1) - 1, d || 1, 0, 0, 0, 0);
+}
+
+function inRange(dt: Date, from: Date, to: Date) {
+  const t = dt.getTime();
+  return t >= from.getTime() && t <= to.getTime();
+}
+
+function fmtDT(v: string) {
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return v;
+  return d.toLocaleString();
+}
+
+function toLocalInputValue(isoOrMysql: string) {
+  // Accepts ISO or "YYYY-MM-DD HH:mm:ss"
+  const d = new Date(isoOrMysql.replace(" ", "T"));
+  if (Number.isNaN(d.getTime())) return "";
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
+}
+
+function statusColor(s: Status): "default" | "info" | "success" | "warning" | "error" {
+  if (s === "completed") return "success";
+  if (s === "checked_in") return "info";
+  if (s === "cancelled") return "error";
+  if (s === "no_show") return "warning";
+  return "default"; // booked
+}
+
+function StatusChip({ status }: { status: Status }) {
+  return (
+    <Chip
+      size="small"
+      label={status.replace("_", " ")}
+      color={statusColor(status)}
+      variant={status === "booked" ? "outlined" : "filled"}
+      sx={{ fontWeight: 800, textTransform: "capitalize" }}
+    />
+  );
 }
 
 export default function Appointments() {
+  const theme = useTheme();
+  const isMobile = useMediaQuery(theme.breakpoints.down("sm"));
+  const dialogFullScreen = useMediaQuery(theme.breakpoints.down("sm"));
+
   const [rows, setRows] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // lookup lists
   const [clients, setClients] = useState<Client[]>([]);
   const [staff, setStaff] = useState<Staff[]>([]);
   const [services, setServices] = useState<Service[]>([]);
+
+  // filters
+  const [q, setQ] = useState("");
+  const [statusFilter, setStatusFilter] = useState<"all" | Status>("all");
+  const [staffFilter, setStaffFilter] = useState<string>("all");
+
+  // date range
+  const [from, setFrom] = useState(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 6);
+    return isoDate(d);
+  });
+  const [to, setTo] = useState(() => isoDate(new Date()));
 
   // dialog
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Row | null>(null);
 
   // form
-  const [client_id, setClientId] = useState<number>(0);
-  const [staff_id, setStaffId] = useState<number>(0);
+  const [client_id, setClientId] = useState<string>("");
+  const [staff_id, setStaffId] = useState<string>("");
   const [start_at, setStartAt] = useState<string>("");
   const [end_at, setEndAt] = useState<string>("");
-  const [status, setStatus] = useState<Row["status"]>("booked");
+  const [status, setStatus] = useState<Status>("booked");
   const [notes, setNotes] = useState<string>("");
+  const [service_ids, setServiceIds] = useState<number[]>([]);
 
-  // services selection (MVP: single service or multi by IDs)
-  const [serviceIds, setServiceIds] = useState<number[]>([]);
-  const [serviceIdInput, setServiceIdInput] = useState<number>(0);
-
-  const cols: GridColDef[] = useMemo(
-    () => [
-      { field: "id", headerName: "ID", flex: 1,minWidth: 90 },
-      { field: "client_name", headerName: "Client",flex: 1,minWidth: 220 },
-      { field: "staff_name", headerName: "Staff", flex: 1,minWidth: 220 },
-      { field: "start_at", headerName: "Start", flex: 1,minWidth: 190, valueFormatter: (p: any) => fmtLocal(String(p.value || "")) },
-      { field: "end_at", headerName: "End", flex: 1,minWidth: 190, valueFormatter: (p: any) => fmtLocal(String(p.value || "")) },
-      { field: "status", headerName: "Status", flex: 1,minWidth: 140 },
-      { field: "notes", headerName: "Notes", flex: 1, minWidth: 220 },
-    ],
-    []
-  );
-
-  const fetchLookups = async () => {
-    const [c, s, sv] = await Promise.all([api.get("/clients"), api.get("/staff"), api.get("/services")]);
-    setClients((c.data.rows || []).map((r: any) => ({ id: r.id, first_name: r.first_name, last_name: r.last_name })));
-    setStaff((s.data.rows || []).map((r: any) => ({ id: r.id, first_name: r.first_name, last_name: r.last_name, commission_rate: r.commission_rate })));
-    setServices((sv.data.rows || []).map((r: any) => ({ id: r.id, name: r.name, price: Number(r.price || 0), commission_rate: r.commission_rate === null ? null : Number(r.commission_rate), duration_mins: Number(r.duration_mins || 60) })));
-  };
+  // toast
+  const [toast, setToast] = useState<{ open: boolean; type: "success" | "error"; msg: string }>({
+    open: false,
+    type: "success",
+    msg: "",
+  });
+  const notify = (type: "success" | "error", msg: string) => setToast({ open: true, type, msg });
 
   const fetchRows = async () => {
     setLoading(true);
     try {
       const r = await api.get("/appointments");
-      setRows(r.data.rows || []);
+      setRows((r.data?.rows || []) as Row[]);
+    } catch (e: any) {
+      notify("error", e?.response?.data?.error || "Failed to load appointments");
     } finally {
       setLoading(false);
     }
   };
 
+  const fetchLookups = async () => {
+    try {
+      const [c, s, sv] = await Promise.all([api.get("/clients"), api.get("/staff"), api.get("/services")]);
+      setClients((c.data?.rows || []) as Client[]);
+      setStaff((s.data?.rows || []) as Staff[]);
+      setServices((sv.data?.rows || []) as Service[]);
+    } catch {
+      // if any fail, still show page; dropdowns might be empty
+    }
+  };
+
   useEffect(() => {
-    (async () => {
-      await fetchLookups();
-      await fetchRows();
-    })();
+    fetchLookups();
+    fetchRows();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const range = useMemo(() => {
+    const f = parseYmd(from);
+    const t = parseYmd(to);
+    t.setHours(23, 59, 59, 999);
+    return { f, t };
+  }, [from, to]);
+
+  const filtered = useMemo(() => {
+    const qq = q.trim().toLowerCase();
+
+    return rows.filter((r) => {
+      const dt = new Date(r.start_at);
+      const matchesDate = !Number.isNaN(dt.getTime()) ? inRange(dt, range.f, range.t) : true;
+
+      const matchesQ =
+        !qq ||
+        String(r.client_name || "").toLowerCase().includes(qq) ||
+        String(r.staff_name || "").toLowerCase().includes(qq) ||
+        String(r.notes || "").toLowerCase().includes(qq) ||
+        String(r.id).includes(qq);
+
+      const matchesStatus = statusFilter === "all" ? true : r.status === statusFilter;
+      const matchesStaff = staffFilter === "all" ? true : String(r.staff_id) === String(staffFilter);
+
+      return matchesDate && matchesQ && matchesStatus && matchesStaff;
+    });
+  }, [rows, q, statusFilter, staffFilter, range.f, range.t]);
+
+  const stats = useMemo(() => {
+    const total = filtered.length;
+    const completed = filtered.filter((r) => r.status === "completed").length;
+    const booked = filtered.filter((r) => r.status === "booked").length;
+    const checkedIn = filtered.filter((r) => r.status === "checked_in").length;
+    return { total, completed, booked, checkedIn };
+  }, [filtered]);
 
   const openCreate = () => {
     setEditing(null);
-    setClientId(clients[0]?.id || 0);
-    setStaffId(staff[0]?.id || 0);
+    setClientId("");
+    setStaffId("");
     setStartAt("");
     setEndAt("");
     setStatus("booked");
     setNotes("");
     setServiceIds([]);
-    setServiceIdInput(services[0]?.id || 0);
     setOpen(true);
   };
 
   const openEdit = async (r: Row) => {
     setEditing(r);
-    setClientId(r.client_id);
-    setStaffId(r.staff_id);
-    setStartAt(r.start_at?.replace(" ", "T")?.slice(0, 16) || "");
-    setEndAt(r.end_at?.replace(" ", "T")?.slice(0, 16) || "");
+    setClientId(String(r.client_id));
+    setStaffId(String(r.staff_id));
+    setStartAt(toLocalInputValue(r.start_at));
+    setEndAt(toLocalInputValue(r.end_at));
     setStatus(r.status);
-    setNotes(r.notes || "");
+    setNotes((r.notes as string) || "");
 
-    // load items
-    const items = await api.get(`/appointments/${r.id}/items`);
-    setServiceIds((items.data.items || []).map((x: any) => Number(x.service_id)));
-    setServiceIdInput(services[0]?.id || 0);
+    // Load service_ids for appointment
+    try {
+      const items = await api.get(`/appointments/${r.id}/items`);
+      const ids = (items.data?.items || []).map((x: any) => Number(x.service_id)).filter((x: any) => Number.isFinite(x));
+      setServiceIds(ids);
+    } catch {
+      setServiceIds([]);
+    }
 
     setOpen(true);
   };
 
-  const addService = () => {
-    if (!serviceIdInput) return;
-    if (serviceIds.includes(serviceIdInput)) return;
-    setServiceIds([...serviceIds, serviceIdInput]);
-  };
-
-  const removeService = (id: number) => {
-    setServiceIds(serviceIds.filter((x) => x !== id));
-  };
-
   const save = async () => {
-    if (!client_id || !staff_id) {
-      alert("Client and Staff are required.");
-      return;
-    }
-    if (!start_at || !end_at) {
-      alert("Start and End date/time are required.");
-      return;
-    }
-    if (serviceIds.length === 0) {
-      alert("Please add at least 1 service.");
-      return;
-    }
-
     const payload = {
-      client_id,
-      staff_id,
-      start_at: start_at.replace("T", " ") + ":00",
-      end_at: end_at.replace("T", " ") + ":00",
+      client_id: Number(client_id || 0),
+      staff_id: Number(staff_id || 0),
+      start_at: start_at ? start_at.replace("T", " ") + ":00" : "",
+      end_at: end_at ? end_at.replace("T", " ") + ":00" : "",
       status,
       notes,
-      service_ids: serviceIds,
+      service_ids,
     };
 
-    if (editing) await api.put(`/appointments/${editing.id}`, payload);
-    else await api.post("/appointments", payload);
+    if (payload.client_id <= 0 || payload.staff_id <= 0) {
+      notify("error", "Please select client and staff");
+      return;
+    }
+    if (!payload.start_at || !payload.end_at) {
+      notify("error", "Start and end date/time are required");
+      return;
+    }
+    if (!Array.isArray(payload.service_ids) || payload.service_ids.length === 0) {
+      notify("error", "Please select at least one service");
+      return;
+    }
 
-    setOpen(false);
-    fetchRows();
+    // basic validation
+    const s = new Date(payload.start_at.replace(" ", "T"));
+    const e = new Date(payload.end_at.replace(" ", "T"));
+    if (!Number.isNaN(s.getTime()) && !Number.isNaN(e.getTime()) && e.getTime() <= s.getTime()) {
+      notify("error", "End time must be after start time");
+      return;
+    }
+
+    try {
+      if (editing) await api.put(`/appointments/${editing.id}`, payload);
+      else await api.post("/appointments", payload);
+
+      notify("success", editing ? "Appointment updated" : "Appointment created");
+      setOpen(false);
+      fetchRows();
+    } catch (e: any) {
+      notify("error", e?.response?.data?.error || "Save failed");
+    }
   };
 
   const del = async (id: number) => {
     if (!confirm("Delete this appointment?")) return;
-    await api.delete(`/appointments/${id}`);
-    fetchRows();
+    try {
+      await api.delete(`/appointments/${id}`);
+      notify("success", "Appointment deleted");
+      fetchRows();
+    } catch (e: any) {
+      notify("error", e?.response?.data?.error || "Delete failed");
+    }
   };
 
-  const setApptStatus = async (id: number, next: Row["status"]) => {
-    await api.put(`/appointments/${id}/status`, { status: next });
-    fetchRows();
-  };
+  function ActionsCell({ row }: { row: Row }) {
+    const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
+    const openMenu = Boolean(anchorEl);
+
+    if (!isMobile) {
+      return (
+        <Stack direction="row" spacing={1} justifyContent="flex-end" sx={{ width: "100%" }}>
+          <Button size="small" variant="outlined" onClick={() => openEdit(row)}>
+            Edit
+          </Button>
+          <Button size="small" color="error" variant="outlined" onClick={() => del(row.id)}>
+            Delete
+          </Button>
+        </Stack>
+      );
+    }
+
+    return (
+      <>
+        <IconButton size="small" onClick={(e) => setAnchorEl(e.currentTarget)}>
+          <MoreVertIcon fontSize="small" />
+        </IconButton>
+        <Menu anchorEl={anchorEl} open={openMenu} onClose={() => setAnchorEl(null)}>
+          <MenuItem
+            onClick={() => {
+              setAnchorEl(null);
+              openEdit(row);
+            }}
+          >
+            Edit
+          </MenuItem>
+          <MenuItem
+            onClick={() => {
+              setAnchorEl(null);
+              del(row.id);
+            }}
+            sx={{ color: "error.main" }}
+          >
+            Delete
+          </MenuItem>
+        </Menu>
+      </>
+    );
+  }
+
+  const cols: GridColDef[] = useMemo(
+    () => [
+      { field: "id", headerName: "ID", flex: 0.45, minWidth: 70 } as GridColDef,
+      {
+        field: "start_at",
+        headerName: "Schedule",
+        flex: 1.4,
+        minWidth: 220,
+        renderCell: (p: GridRenderCellParams<any, any, any, any>) => (
+          <Stack spacing={0.4} sx={{ py: 0.5 }}>
+            <Typography sx={{ fontWeight: 900, lineHeight: 1.2 }}>{fmtDT(p.row.start_at)}</Typography>
+            <Typography variant="caption" color="text.secondary">
+              to {fmtDT(p.row.end_at)}
+            </Typography>
+          </Stack>
+        ),
+      } as GridColDef,
+      {
+        field: "client_name",
+        headerName: "Client",
+        flex: 1.2,
+        minWidth: 170,
+        renderCell: (p: GridRenderCellParams<any, any, any, any>) => (
+          <Typography sx={{ fontWeight: 800 }}>{p.row.client_name}</Typography>
+        ),
+      } as GridColDef,
+      { field: "staff_name", headerName: "Staff", flex: 1.1, minWidth: 160 } as GridColDef,
+      {
+        field: "status",
+        headerName: "Status",
+        flex: 0.9,
+        minWidth: 140,
+        renderCell: (p: GridRenderCellParams<any>) => <StatusChip status={(p.value || "booked") as Status} />,
+      } as GridColDef,
+      {
+        field: "notes",
+        headerName: "Notes",
+        flex: 1.4,
+        minWidth: 220,
+        valueFormatter: (p: any) => (p.value ? String(p.value) : "—"),
+      } as GridColDef,
+      {
+        field: "actions",
+        headerName: "",
+        sortable: false,
+        filterable: false,
+        disableColumnMenu: true,
+        flex: 0.9,
+        minWidth: 120,
+        align: "right",
+        headerAlign: "right",
+        renderCell: (p: GridRenderCellParams<any, any, any, any>) => <ActionsCell row={p.row as Row} />,
+      } as GridColDef,
+    ],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [isMobile, rows]
+  );
+
+  const staffOptions = staff.filter((s) => (s.status || "active") === "active");
+  const clientOptions = clients.filter((c) => (c.status || "active") === "active");
+  const serviceOptions = services.filter((s) => (s.status || "active") === "active");
 
   return (
     <Box>
-      <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 2 }}>
+      {/* Header */}
+      <Stack
+        direction={{ xs: "column", sm: "row" }}
+        spacing={1.5}
+        sx={{ alignItems: { xs: "stretch", sm: "center" }, justifyContent: "space-between", mb: 2 }}
+      >
         <Box>
           <Typography variant="h5" sx={{ fontWeight: 900 }}>
             Appointments
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            Branch-scoped bookings (auto commission created when marked completed)
+            Bookings per branch • Filter by date range
           </Typography>
         </Box>
-        <Button variant="contained" onClick={openCreate} sx={{ fontWeight: 800 }}>
+
+        <Button variant="contained" onClick={openCreate} sx={{ fontWeight: 900 }} startIcon={<EventIcon />}>
           + Add Appointment
         </Button>
-      </Box>
+      </Stack>
 
-      <Card sx={{ borderRadius: 4 }}>
+      {/* Summary chips */}
+      <Stack direction="row" spacing={1} sx={{ mb: 2, flexWrap: "wrap", gap: 1 }}>
+        <Chip label={`Total: ${stats.total}`} sx={{ fontWeight: 800 }} />
+        <Chip label={`Booked: ${stats.booked}`} variant="outlined" sx={{ fontWeight: 800 }} />
+        <Chip label={`Checked-in: ${stats.checkedIn}`} color="info" variant="outlined" sx={{ fontWeight: 800 }} />
+        <Chip label={`Completed: ${stats.completed}`} color="success" variant="outlined" sx={{ fontWeight: 800 }} />
+      </Stack>
+
+      {/* Filters */}
+      <Card sx={{ borderRadius: 4, mb: 2 }}>
         <CardContent>
-          <Box sx={{ height: 560 }}>
-            <DataGrid
-              rows={rows}
-              columns={[
-                ...cols,
-                {
-                  field: "quick",
-                  headerName: "Quick Actions",
-                  width: 360,
-                  sortable: false,
-                  renderCell: (p) => (
-                    <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
-                      <Button size="small" variant="outlined" onClick={() => openEdit(p.row)}>
-                        Edit
-                      </Button>
-                      <Button size="small" variant="outlined" onClick={() => setApptStatus(p.row.id, "checked_in")}>
-                        Check-in
-                      </Button>
-                      <Button size="small" variant="outlined" onClick={() => setApptStatus(p.row.id, "completed")}>
-                        Complete
-                      </Button>
-                      <Button size="small" color="error" variant="outlined" onClick={() => del(p.row.id)}>
-                        Delete
-                      </Button>
-                    </Box>
-                  ),
-                },
-              ]}
-              loading={loading}
-              disableRowSelectionOnClick
-              pageSizeOptions={[10, 25, 50]}
-              initialState={{ pagination: { paginationModel: { pageSize: 10, page: 0 } } }}
+          <Stack direction={{ xs: "column", md: "row" }} spacing={1.5} sx={{ alignItems: { md: "center" } }}>
+            <TextField
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Search client / staff / notes / ID"
+              size="small"
+              fullWidth
+              InputProps={{
+                startAdornment: (
+                  <InputAdornment position="start">
+                    <SearchIcon fontSize="small" />
+                  </InputAdornment>
+                ),
+              }}
             />
-          </Box>
+
+            <TextField
+              select
+              size="small"
+              label="Status"
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value as any)}
+              sx={{ minWidth: { xs: "100%", md: 170 } }}
+            >
+              <MenuItem value="all">All</MenuItem>
+              <MenuItem value="booked">booked</MenuItem>
+              <MenuItem value="checked_in">checked in</MenuItem>
+              <MenuItem value="completed">completed</MenuItem>
+              <MenuItem value="cancelled">cancelled</MenuItem>
+              <MenuItem value="no_show">no show</MenuItem>
+            </TextField>
+
+            <TextField
+              select
+              size="small"
+              label="Staff"
+              value={staffFilter}
+              onChange={(e) => setStaffFilter(e.target.value)}
+              sx={{ minWidth: { xs: "100%", md: 220 } }}
+            >
+              <MenuItem value="all">All staff</MenuItem>
+              {staffOptions.map((s) => (
+                <MenuItem key={s.id} value={String(s.id)}>
+                  {`${s.first_name} ${s.last_name}`.trim()}
+                </MenuItem>
+              ))}
+            </TextField>
+
+            <TextField
+              label="From"
+              type="date"
+              size="small"
+              value={from}
+              onChange={(e) => setFrom(e.target.value)}
+              InputLabelProps={{ shrink: true }}
+              sx={{ minWidth: { xs: "100%", md: 160 } }}
+            />
+            <TextField
+              label="To"
+              type="date"
+              size="small"
+              value={to}
+              onChange={(e) => setTo(e.target.value)}
+              InputLabelProps={{ shrink: true }}
+              sx={{ minWidth: { xs: "100%", md: 160 } }}
+            />
+
+            <Box sx={{ flex: 1 }} />
+
+            <Typography variant="body2" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>
+              {filtered.length} appointment{filtered.length === 1 ? "" : "s"}
+            </Typography>
+          </Stack>
         </CardContent>
       </Card>
 
-      <Dialog open={open} onClose={() => setOpen(false)} fullWidth maxWidth="md">
+      {/* Table */}
+      <Card sx={{ borderRadius: 4 }}>
+        <CardContent>
+          <DataGrid
+            autoHeight
+            rows={filtered}
+            columns={cols}
+            loading={loading}
+            disableRowSelectionOnClick
+            disableColumnMenu
+            density="compact"
+            pageSizeOptions={[10, 25, 50]}
+            initialState={{ pagination: { paginationModel: { pageSize: 10, page: 0 } } }}
+            sx={{
+              border: 0,
+              "& .MuiDataGrid-cell": { outline: "none" },
+              "& .MuiDataGrid-columnHeaders": { borderRadius: 2 },
+            }}
+            localeText={{
+              noRowsLabel: "No appointments yet. Click “Add Appointment” to create your first booking.",
+            }}
+          />
+        </CardContent>
+      </Card>
+
+      {/* Add/Edit Dialog */}
+      <Dialog open={open} onClose={() => setOpen(false)} fullWidth maxWidth="sm" fullScreen={dialogFullScreen}>
         <DialogTitle sx={{ fontWeight: 900 }}>{editing ? "Edit Appointment" : "Add Appointment"}</DialogTitle>
         <DialogContent sx={{ pt: 1 }}>
-          <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 2, mt: 1 }}>
+          <Stack spacing={2} sx={{ mt: 1 }}>
             <TextField
               select
               label="Client"
-              value={client_id || ""}
-              onChange={(e) => setClientId(Number(e.target.value))}
+              value={client_id}
+              onChange={(e) => setClientId(e.target.value)}
+              helperText="Client must be in this branch"
             >
-              {clients.map((c) => (
-                <MenuItem key={c.id} value={c.id}>
-                  {c.first_name} {c.last_name}
-                </MenuItem>
-              ))}
-            </TextField>
-
-            <TextField select label="Staff" value={staff_id || ""} onChange={(e) => setStaffId(Number(e.target.value))}>
-              {staff.map((s) => (
-                <MenuItem key={s.id} value={s.id}>
-                  {s.first_name} {s.last_name}
+              {clientOptions.map((c) => (
+                <MenuItem key={c.id} value={String(c.id)}>
+                  {`${c.first_name} ${c.last_name}`.trim()}
                 </MenuItem>
               ))}
             </TextField>
 
             <TextField
-              label="Start"
-              type="datetime-local"
-              value={start_at}
-              onChange={(e) => setStartAt(e.target.value)}
-              InputLabelProps={{ shrink: true }}
-            />
-
-            <TextField
-              label="End"
-              type="datetime-local"
-              value={end_at}
-              onChange={(e) => setEndAt(e.target.value)}
-              InputLabelProps={{ shrink: true }}
-            />
-
-            <TextField select label="Status" value={status} onChange={(e) => setStatus(e.target.value as any)}>
-              {statusOptions.map((s) => (
-                <MenuItem key={s} value={s}>
-                  {s}
+              select
+              label="Staff"
+              value={staff_id}
+              onChange={(e) => setStaffId(e.target.value)}
+              helperText="Staff must be in this branch"
+            >
+              {staffOptions.map((s) => (
+                <MenuItem key={s.id} value={String(s.id)}>
+                  {`${s.first_name} ${s.last_name}`.trim()}
                 </MenuItem>
               ))}
             </TextField>
 
-            <TextField label="Notes" value={notes} onChange={(e) => setNotes(e.target.value)} />
-          </Box>
-
-          <Box sx={{ mt: 2 }}>
-            <Typography sx={{ fontWeight: 800, mb: 1 }}>Services</Typography>
-            <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap", alignItems: "center" }}>
+            <Stack direction={{ xs: "column", sm: "row" }} spacing={2}>
               <TextField
-                select
-                label="Add service"
-                value={serviceIdInput || ""}
-                onChange={(e) => setServiceIdInput(Number(e.target.value))}
-                sx={{ minWidth: 320 }}
-              >
-                {services.map((sv) => (
-                  <MenuItem key={sv.id} value={sv.id}>
-                    {sv.name} — ${sv.price.toFixed(2)}
-                  </MenuItem>
-                ))}
-              </TextField>
-              <Button variant="outlined" onClick={addService} sx={{ fontWeight: 800 }}>
-                Add
-              </Button>
-            </Box>
+                label="Start"
+                type="datetime-local"
+                value={start_at}
+                onChange={(e) => setStartAt(e.target.value)}
+                InputLabelProps={{ shrink: true }}
+                fullWidth
+              />
+              <TextField
+                label="End"
+                type="datetime-local"
+                value={end_at}
+                onChange={(e) => setEndAt(e.target.value)}
+                InputLabelProps={{ shrink: true }}
+                fullWidth
+              />
+            </Stack>
 
-            <Box sx={{ mt: 1, display: "flex", gap: 1, flexWrap: "wrap" }}>
-              {serviceIds.map((sid) => {
-                const sv = services.find((x) => x.id === sid);
-                return (
-                  <Button
-                    key={sid}
-                    size="small"
-                    variant="outlined"
-                    onClick={() => removeService(sid)}
-                    sx={{ borderRadius: 999 }}
-                    title="Click to remove"
-                  >
-                    {sv ? `${sv.name}` : `Service ${sid}`} ✕
-                  </Button>
-                );
-              })}
-            </Box>
-          </Box>
+            <TextField select label="Status" value={status} onChange={(e) => setStatus(e.target.value as Status)}>
+              <MenuItem value="booked">booked</MenuItem>
+              <MenuItem value="checked_in">checked in</MenuItem>
+              <MenuItem value="completed">completed</MenuItem>
+              <MenuItem value="cancelled">cancelled</MenuItem>
+              <MenuItem value="no_show">no show</MenuItem>
+            </TextField>
+
+            <TextField
+              select
+              label="Services"
+              SelectProps={{
+                multiple: true,
+                value: service_ids,
+                onChange: (e) => {
+                  const v = e.target.value as any;
+                  const arr = Array.isArray(v) ? v : [v];
+                  setServiceIds(arr.map((x) => Number(x)).filter((x) => Number.isFinite(x)));
+                },
+              }}
+              helperText="Select one or multiple services"
+            >
+              {serviceOptions.map((s) => (
+                <MenuItem key={s.id} value={s.id}>
+                  {s.category ? `[${s.category}] ` : ""}
+                  {s.name} — ₱{Number(s.price || 0).toFixed(2)}
+                </MenuItem>
+              ))}
+            </TextField>
+
+            <TextField
+              label="Notes"
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              multiline
+              minRows={2}
+              placeholder="Optional notes (preferences, reminders, etc.)"
+            />
+
+            {status === "completed" && (
+              <Alert severity="info" variant="outlined">
+                Marking as <b>completed</b> will compute commission (based on your backend logic).
+              </Alert>
+            )}
+          </Stack>
         </DialogContent>
 
         <DialogActions sx={{ p: 2 }}>
-          <Button onClick={() => setOpen(false)}>Cancel</Button>
-          <Button variant="contained" onClick={save} sx={{ fontWeight: 800 }}>
+          <Button onClick={() => setOpen(false)} variant="text" fullWidth={dialogFullScreen}>
+            Cancel
+          </Button>
+          <Button onClick={save} variant="contained" sx={{ fontWeight: 900 }} fullWidth={dialogFullScreen}>
             Save
           </Button>
         </DialogActions>
       </Dialog>
+
+      {/* Toast */}
+      <Snackbar
+        open={toast.open}
+        autoHideDuration={2500}
+        onClose={() => setToast((t) => ({ ...t, open: false }))}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert severity={toast.type} variant="filled" onClose={() => setToast((t) => ({ ...t, open: false }))}>
+          {toast.msg}
+        </Alert>
+      </Snackbar>
     </Box>
   );
 }

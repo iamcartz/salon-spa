@@ -2,104 +2,168 @@
 // src/routes_dashboard.php
 declare(strict_types=1);
 
+require_once __DIR__ . "/response.php";
 require_once __DIR__ . "/auth_mw.php";
 require_once __DIR__ . "/branch_scope.php";
-require_once __DIR__ . "/response.php";
 
-function dash_date(string $v): string {
+/**
+ * Helpers to make this work even if your DB uses slightly different column names
+ * (e.g. payments.paid_at vs payments.created_at, payments.amount vs payments.total).
+ */
+function column_exists(PDO $pdo, string $table, string $col): bool {
+  $sql = "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?";
+  $st = $pdo->prepare($sql);
+  $st->execute([$table, $col]);
+  return (int)$st->fetchColumn() > 0;
+}
+
+function pick_existing_col(PDO $pdo, string $table, array $candidates, string $fallback): string {
+  foreach ($candidates as $c) {
+    if (column_exists($pdo, $table, $c)) return $c;
+  }
+  return $fallback;
+}
+
+function date_or_default(string $v, string $fallback): string {
   $v = trim($v);
-  if ($v === "") return "";
-  if (!preg_match("/^\d{4}-\d{2}-\d{2}$/", $v)) return "";
+  if ($v === "") return $fallback;
+  // accept YYYY-MM-DD only
+  if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $v)) return $fallback;
   return $v;
 }
 
+function build_date_range(string $from, string $to): array {
+  $out = [];
+  $start = new DateTime($from);
+  $end = new DateTime($to);
+  if ($start > $end) {
+    $tmp = $start; $start = $end; $end = $tmp;
+  }
+  while ($start <= $end) {
+    $out[] = $start->format("Y-m-d");
+    $start->modify("+1 day");
+  }
+  return $out;
+}
+
+/**
+ * GET /dashboard?from=YYYY-MM-DD&to=YYYY-MM-DD
+ */
 if ($path === "/dashboard" && $method === "GET") {
   $user = require_auth($pdo, $cfg);
   $branchId = require_branch($pdo, (int)$user["id"]);
 
-  $from = dash_date((string)($_GET["from"] ?? ""));
-  $to   = dash_date((string)($_GET["to"] ?? ""));
+  // default last 7 days
+  $today = (new DateTime("today"))->format("Y-m-d");
+  $weekAgo = (new DateTime("today"))->modify("-6 days")->format("Y-m-d");
 
-  // Default range: last 7 days
-  if ($to === "") $to = date("Y-m-d");
-  if ($from === "") $from = date("Y-m-d", strtotime($to . " -6 days"));
+  $from = date_or_default((string)($_GET["from"] ?? ""), $weekAgo);
+  $to   = date_or_default((string)($_GET["to"] ?? ""), $today);
 
-  $fromDt = $from . " 00:00:00";
-  $toDt   = $to . " 23:59:59";
+  // pick date columns safely
+  $paymentsDateCol = pick_existing_col($pdo, "payments", ["paid_at", "payment_date", "created_at"], "created_at");
+  $paymentsAmountCol = pick_existing_col($pdo, "payments", ["amount", "total_amount", "paid_amount"], "amount");
 
-  // --- KPIs ---
-  $qAppt = $pdo->prepare("SELECT COUNT(*) FROM appointments WHERE branch_id=? AND start_at BETWEEN ? AND ?");
-  $qAppt->execute([$branchId, $fromDt, $toDt]);
-  $appointments = (int)$qAppt->fetchColumn();
+  $clientsDateCol = pick_existing_col($pdo, "clients", ["created_at", "date_created"], "created_at");
+  $commDateCol = pick_existing_col($pdo, "commissions", ["created_at", "date_created"], "created_at");
 
-  $qComp = $pdo->prepare("SELECT COUNT(*) FROM appointments WHERE branch_id=? AND status='completed' AND start_at BETWEEN ? AND ?");
-  $qComp->execute([$branchId, $fromDt, $toDt]);
-  $completed = (int)$qComp->fetchColumn();
+  // appointments: use start_at for charts/filters
+  $apptDateCol = pick_existing_col($pdo, "appointments", ["start_at", "created_at"], "start_at");
 
-  // Sales (adjust payments.amount if your schema differs)
-  $qSales = $pdo->prepare("
-    SELECT COALESCE(SUM(p.amount),0)
-    FROM payments p
-    JOIN appointments a ON a.id=p.appointment_id AND a.branch_id=p.branch_id
-    WHERE p.branch_id=? AND a.status='completed' AND a.start_at BETWEEN ? AND ?
+  // KPIs
+  // 1) Sales total
+  $sales = 0.0;
+  if (column_exists($pdo, "payments", $paymentsAmountCol)) {
+    $q = $pdo->prepare("
+      SELECT COALESCE(SUM($paymentsAmountCol),0) AS total
+      FROM payments
+      WHERE branch_id=?
+        AND DATE($paymentsDateCol) BETWEEN ? AND ?
+    ");
+    $q->execute([$branchId, $from, $to]);
+    $sales = (float)$q->fetchColumn();
+  }
+
+  // 2) Appointments count
+  $q = $pdo->prepare("
+    SELECT COUNT(*) FROM appointments
+    WHERE branch_id=? AND DATE($apptDateCol) BETWEEN ? AND ?
   ");
-  $qSales->execute([$branchId, $fromDt, $toDt]);
-  $sales = (float)$qSales->fetchColumn();
+  $q->execute([$branchId, $from, $to]);
+  $appointmentsCount = (int)$q->fetchColumn();
 
-  $qComm = $pdo->prepare("
-    SELECT COALESCE(SUM(commission_amount),0)
-    FROM commissions
-    WHERE branch_id=? AND appointment_id IN (
-      SELECT id FROM appointments
-      WHERE branch_id=? AND status='completed' AND start_at BETWEEN ? AND ?
-    )
+  // 3) New clients count
+  $q = $pdo->prepare("
+    SELECT COUNT(*) FROM clients
+    WHERE branch_id=? AND DATE($clientsDateCol) BETWEEN ? AND ?
   ");
-  $qComm->execute([$branchId, $branchId, $fromDt, $toDt]);
-  $commissions = (float)$qComm->fetchColumn();
+  $q->execute([$branchId, $from, $to]);
+  $newClients = (int)$q->fetchColumn();
 
-  // New clients (adjust clients.created_at if needed)
-  $qClients = $pdo->prepare("SELECT COUNT(*) FROM clients WHERE branch_id=? AND created_at BETWEEN ? AND ?");
-  $qClients->execute([$branchId, $fromDt, $toDt]);
-  $newClients = (int)$qClients->fetchColumn();
+  // 4) Commissions total
+  $commissions = 0.0;
+  if (column_exists($pdo, "commissions", "commission_amount")) {
+    $q = $pdo->prepare("
+      SELECT COALESCE(SUM(commission_amount),0)
+      FROM commissions
+      WHERE branch_id=? AND DATE($commDateCol) BETWEEN ? AND ?
+    ");
+    $q->execute([$branchId, $from, $to]);
+    $commissions = (float)$q->fetchColumn();
+  }
 
-  // --- Charts ---
-  // A) Appointments per day
-  $qDaily = $pdo->prepare("
-    SELECT DATE(start_at) AS day,
-           COUNT(*) AS total,
-           SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed
+  // Chart series (daily)
+  $days = build_date_range($from, $to);
+
+  // Daily revenue
+  $revMap = [];
+  if (column_exists($pdo, "payments", $paymentsAmountCol)) {
+    $q = $pdo->prepare("
+      SELECT DATE($paymentsDateCol) AS d, COALESCE(SUM($paymentsAmountCol),0) AS v
+      FROM payments
+      WHERE branch_id=? AND DATE($paymentsDateCol) BETWEEN ? AND ?
+      GROUP BY DATE($paymentsDateCol)
+      ORDER BY d
+    ");
+    $q->execute([$branchId, $from, $to]);
+    foreach ($q->fetchAll(PDO::FETCH_ASSOC) as $r) {
+      $revMap[(string)$r["d"]] = (float)$r["v"];
+    }
+  }
+
+  // Daily appointments
+  $apptMap = [];
+  $q = $pdo->prepare("
+    SELECT DATE($apptDateCol) AS d, COUNT(*) AS v
     FROM appointments
-    WHERE branch_id=? AND start_at BETWEEN ? AND ?
-    GROUP BY DATE(start_at)
-    ORDER BY DATE(start_at) ASC
+    WHERE branch_id=? AND DATE($apptDateCol) BETWEEN ? AND ?
+    GROUP BY DATE($apptDateCol)
+    ORDER BY d
   ");
-  $qDaily->execute([$branchId, $fromDt, $toDt]);
-  $daily = $qDaily->fetchAll(PDO::FETCH_ASSOC);
+  $q->execute([$branchId, $from, $to]);
+  foreach ($q->fetchAll(PDO::FETCH_ASSOC) as $r) {
+    $apptMap[(string)$r["d"]] = (int)$r["v"];
+  }
 
-  // B) Status breakdown (donut)
-  $qStatus = $pdo->prepare("
-    SELECT status, COUNT(*) AS cnt
-    FROM appointments
-    WHERE branch_id=? AND start_at BETWEEN ? AND ?
-    GROUP BY status
-    ORDER BY cnt DESC
-  ");
-  $qStatus->execute([$branchId, $fromDt, $toDt]);
-  $status = $qStatus->fetchAll(PDO::FETCH_ASSOC);
+  $series = [];
+  foreach ($days as $d) {
+    $series[] = [
+      "date" => $d,
+      "revenue" => (float)($revMap[$d] ?? 0),
+      "appointments" => (int)($apptMap[$d] ?? 0),
+    ];
+  }
 
   json_response(200, [
     "ok" => true,
     "range" => ["from" => $from, "to" => $to],
-    "stats" => [
+    "kpis" => [
       "sales" => $sales,
-      "appointments" => $appointments,
-      "completed" => $completed,
+      "appointments" => $appointmentsCount,
+      "new_clients" => $newClients,
       "commissions" => $commissions,
-      "new_clients" => $newClients
     ],
-    "charts" => [
-      "daily_appointments" => $daily,
-      "status_breakdown" => $status
-    ]
+    "series" => $series,
   ]);
 }
