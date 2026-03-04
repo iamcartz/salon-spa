@@ -1,6 +1,7 @@
 import axios from "axios";
 
-export const API_BASE = "http://localhost:8080/salon-api/public";
+// export const API_BASE = "http://localhost:8080/salon-api/public";
+export const API_BASE = "https://gslweb.gabisanshipping.co/salon-api/public";
 
 export const api = axios.create({
   baseURL: API_BASE,
